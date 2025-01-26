@@ -1,0 +1,293 @@
+module winograd_f2_3 (
+    input  logic               clk,        // 时钟信号
+    input  logic               rst_n,      // 复位信号（低有效）
+    input  logic               start,      // 启动信号
+    input  logic signed [15:0] input_data [0:8],   // 输入特征图（3x3）
+    input  logic signed [15:0] filter_data [0:8],  // 卷积核（3x3）
+    output logic signed [31:0] output_data [0:3],   // 输出特征图（2x2）
+    output logic               done        // 完成信号
+);
+    // 状态定义
+    typedef enum logic [2:0] {
+        IDLE = 3'd0,
+        INPUT_TRANSFORM = 3'd1,
+        FILTER_TRANSFORM = 3'd2,
+        ELEMENT_MULTIPLY = 3'd3,
+        OUTPUT_TRANSFORM = 3'd4,
+        FINISH = 3'd5
+    } state_t;
+
+    state_t current_state, next_state;
+
+    // 中间寄存器
+    logic signed [31:0] d [0:3][0:3];    // 输入矩阵扩展为4x4
+    logic signed [31:0] g [0:3][0:3];    // 滤波器矩阵扩展为4x4
+
+    // 输入转换后的 U = B * d * B^T
+    logic signed [31:0] U [0:3][0:3];
+
+    // 滤波器转换后的 V = G * g * G^T
+    logic signed [31:0] V [0:3][0:3];
+
+    // 元素级乘法结果 M = U .* V
+    logic signed [31:0] M [0:3][0:3];
+
+    // 输出转换后的 Y = A^T * M * A
+    logic signed [31:0] Y [0:1][0:1];
+
+    // 完成信号寄存器
+    logic done_reg;
+
+    // 状态转移
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            current_state <= IDLE;
+        else
+            current_state <= next_state;
+    end
+
+    // 状态机下一状态逻辑
+    always_comb begin
+        case (current_state)
+            IDLE: begin
+                if (start)
+                    next_state = INPUT_TRANSFORM;
+                else
+                    next_state = IDLE;
+            end
+            INPUT_TRANSFORM: next_state = FILTER_TRANSFORM;
+            FILTER_TRANSFORM: next_state = ELEMENT_MULTIPLY;
+            ELEMENT_MULTIPLY: next_state = OUTPUT_TRANSFORM;
+            OUTPUT_TRANSFORM: next_state = FINISH;
+            FINISH: next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // 初始化输入矩阵 d 和滤波器矩阵 g
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // 清零 d 和 g
+            for (int i = 0; i < 4; i++) begin
+                for (int j = 0; j < 4; j++) begin
+                    d[i][j] <= 32'd0;
+                    g[i][j] <= 32'd0;
+                end
+            end
+        end else if (current_state == IDLE && start) begin
+            // 填充输入数据到 d 矩阵（3x3 输入，扩展为4x4，边缘补零）
+            d[0][0] <= input_data[0];
+            d[0][1] <= input_data[1];
+            d[0][2] <= input_data[2];
+            d[0][3] <= 32'd0;
+
+            d[1][0] <= input_data[3];
+            d[1][1] <= input_data[4];
+            d[1][2] <= input_data[5];
+            d[1][3] <= 32'd0;
+
+            d[2][0] <= input_data[6];
+            d[2][1] <= input_data[7];
+            d[2][2] <= input_data[8];
+            d[2][3] <= 32'd0;
+
+            d[3][0] <= 32'd0;
+            d[3][1] <= 32'd0;
+            d[3][2] <= 32'd0;
+            d[3][3] <= 32'd0;
+
+            // 填充滤波器数据到 g 矩阵（3x3 滤波器，扩展为4x4，边缘补零）
+            g[0][0] <= filter_data[0];
+            g[0][1] <= filter_data[1];
+            g[0][2] <= filter_data[2];
+            g[0][3] <= 32'd0;
+
+            g[1][0] <= filter_data[3];
+            g[1][1] <= filter_data[4];
+            g[1][2] <= filter_data[5];
+            g[1][3] <= 32'd0;
+
+            g[2][0] <= filter_data[6];
+            g[2][1] <= filter_data[7];
+            g[2][2] <= filter_data[8];
+            g[2][3] <= 32'd0;
+
+            g[3][0] <= 32'd0;
+            g[3][1] <= 32'd0;
+            g[3][2] <= 32'd0;
+            g[3][3] <= 32'd0;
+        end
+    end
+
+    // 输入转换： U = B * d * B^T
+    // B 矩阵：
+    // [1  0 -1  0]
+    // [0  1  1  0]
+    // [0 -1  1  0]
+    // [0  1  0 -1]
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // 清零 U
+            for (int i = 0; i < 4; i++) begin
+                for (int j = 0; j < 4; j++) begin
+                    U[i][j] <= 32'd0;
+                end
+            end
+        end else if (current_state == INPUT_TRANSFORM) begin
+            // 行变换: Bt_d = B * d
+            // B 的每一行与 d 的每一列相乘
+            logic signed [31:0] Bt_d [0:3][0:3];
+            // 计算 Bt_d
+            Bt_d[0][0] = d[0][0] - d[0][2];
+            Bt_d[0][1] = d[0][1] + d[0][2];
+            Bt_d[0][2] = d[0][1] - d[0][2];
+            Bt_d[0][3] = d[0][1] - d[0][3];
+
+            Bt_d[1][0] = d[1][0] - d[1][2];
+            Bt_d[1][1] = d[1][1] + d[1][2];
+            Bt_d[1][2] = d[1][1] - d[1][2];
+            Bt_d[1][3] = d[1][1] - d[1][3];
+
+            Bt_d[2][0] = d[2][0] - d[2][2];
+            Bt_d[2][1] = d[2][1] + d[2][2];
+            Bt_d[2][2] = d[2][1] - d[2][2];
+            Bt_d[2][3] = d[2][1] - d[2][3];
+
+            Bt_d[3][0] = d[3][0] - d[3][2];
+            Bt_d[3][1] = d[3][1] + d[3][2];
+            Bt_d[3][2] = d[3][1] - d[3][2];
+            Bt_d[3][3] = d[3][1] - d[3][3];
+
+            // 列变换: U = Bt_d * B^T
+            for (int i = 0; i < 4; i++) begin
+                U[i][0] = Bt_d[i][0] - Bt_d[i][2];
+                U[i][1] = Bt_d[i][1] + Bt_d[i][2];
+                U[i][2] = Bt_d[i][1] - Bt_d[i][2];
+                U[i][3] = Bt_d[i][1] - Bt_d[i][3];
+            end
+        end
+    end
+
+    // 滤波器转换： V = G * g * G^T
+    // G 矩阵：
+    // [1    0    0]
+    // [0.5  0.5  0.5]
+    // [0.5 -0.5  0.5]
+    // [0    0    1]
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // 清零 V
+            for (int i = 0; i < 4; i++) begin
+                for (int j = 0; j < 4; j++) begin
+                    V[i][j] <= 32'd0;
+                end
+            end
+        end else if (current_state == FILTER_TRANSFORM) begin
+            // 行变换: Gg = G * g
+            logic signed [31:0] Gg [0:3][0:3];
+            Gg[0][0] = g[0][0];
+            Gg[0][1] = g[0][1];
+            Gg[0][2] = g[0][2];
+            Gg[0][3] = 32'd0;
+
+            Gg[1][0] = (g[1][0] + g[1][1] + g[1][2]) >>> 1; // 0.5*(g1+g2+g3)
+            Gg[1][1] = (g[1][0] - g[1][1] + g[1][2]) >>> 1; // 0.5*(g1 - g2 + g3)
+            Gg[1][2] = Gg[1][0];
+            Gg[1][3] = Gg[1][1];
+
+            Gg[2][0] = (g[2][0] + g[2][1] + g[2][2]) >>> 1;
+            Gg[2][1] = (g[2][0] - g[2][1] + g[2][2]) >>> 1;
+            Gg[2][2] = Gg[2][0];
+            Gg[2][3] = Gg[2][1];
+
+            Gg[3][0] = g[3][0];
+            Gg[3][1] = g[3][1];
+            Gg[3][2] = g[3][2];
+            Gg[3][3] = 32'd0;
+
+            // 列变换: V = Gg * G^T
+            for (int i = 0; i < 4; i++) begin
+                V[i][0] = Gg[i][0] - Gg[i][2];
+                V[i][1] = Gg[i][1] + Gg[i][2];
+                V[i][2] = Gg[i][1] - Gg[i][2];
+                V[i][3] = Gg[i][1] - Gg[i][3];
+            end
+        end
+    end
+
+    // 元素级乘法： M = U .* V
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // 清零 M
+            for (int i = 0; i < 4; i++) begin
+                for (int j = 0; j < 4; j++) begin
+                    M[i][j] <= 32'd0;
+                end
+            end
+        end else if (current_state == ELEMENT_MULTIPLY) begin
+            for (int i = 0; i < 4; i++) begin
+                for (int j = 0; j < 4; j++) begin
+                    M[i][j] <= U[i][j] * V[i][j]; // 乘法结果可能需要截断或调整位宽
+                end
+            end
+        end
+    end
+
+    // 输出转换： Y = A^T * M * A
+    // A 矩阵：
+    // [1  1  1  0]
+    // [0  1 -1 -1]
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // 清零 Y
+            for (int i = 0; i < 2; i++) begin
+                for (int j = 0; j < 2; j++) begin
+                    Y[i][j] <= 32'd0;
+                end
+            end
+        end else if (current_state == OUTPUT_TRANSFORM) begin
+            // 行变换: AtM = A^T * M
+            logic signed [31:0] AtM [0:1][0:4];
+            AtM[0][0] = M[0][0] + M[0][1] + M[0][2];
+            AtM[0][1] = M[0][1] - M[0][2] - M[0][3];
+
+            AtM[1][0] = M[1][0] + M[1][1] + M[1][2];
+            AtM[1][1] = M[1][1] - M[1][2] - M[1][3];
+
+            // 列变换: Y = AtM * A
+            Y[0][0] = AtM[0][0] + AtM[1][0] + M[2][0];
+            Y[0][1] = AtM[0][1] + AtM[1][1] + M[2][1];
+            Y[1][0] = AtM[0][0] - AtM[1][0] - M[2][0];
+            Y[1][1] = AtM[0][1] - AtM[1][1] - M[2][1];
+        end
+    end
+
+    // 输出结果和完成信号
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int i = 0; i < 4; i++) begin
+                output_data[i] <= 32'd0;
+            end
+            done_reg <= 1'b0;
+        end else begin
+            done_reg <= 1'b0;
+            case (current_state)
+                OUTPUT_TRANSFORM: begin
+                    // 将 Y 转换为输出
+                    output_data[0] <= Y[0][0];
+                    output_data[1] <= Y[0][1];
+                    output_data[2] <= Y[1][0];
+                    output_data[3] <= Y[1][1];
+                end
+                FINISH: begin
+                    done_reg <= 1'b1;
+                end
+                default: ;
+            endcase
+        end
+    end
+
+    // 设置完成信号
+    assign done = done_reg;
+
+endmodule
